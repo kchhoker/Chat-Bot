@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Chat-Bot — realtime chat at scale</title>
+  <link rel="stylesheet" href="/style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>" />
+</head>
+<body>
+  <!-- Join screen -->
+  <div id="join-screen" class="join-screen">
+    <form id="join-form" class="join-card">
+      <h1>💬 Chat-Bot</h1>
+      <p class="tagline">Real-time chat over WebSockets, scaled across server instances with Redis pub/sub.</p>
+      <label>
+        Name
+        <input id="username" type="text" maxlength="32" placeholder="e.g. kabir" autocomplete="off" required />
+      </label>
+      <label>
+        Room
+        <input id="room" type="text" maxlength="32" placeholder="general" autocomplete="off" value="general" />
+      </label>
+      <button type="submit">Join chat</button>
+      <p id="join-error" class="error" hidden></p>
+    </form>
+  </div>
+
+  <!-- Chat screen -->
+  <div id="chat-screen" class="chat-screen" hidden>
+    <aside class="sidebar">
+      <header class="brand">💬 Chat-Bot</header>
+      <section class="panel">
+        <h2>Room</h2>
+        <div id="room-name" class="room-name"></div>
+        <form id="switch-form" class="switch-form">
+          <input id="switch-room" type="text" maxlength="32" placeholder="switch room…" autocomplete="off" />
+        </form>
+      </section>
+      <section class="panel">
+        <h2>Online <span id="user-count" class="count"></span></h2>
+        <ul id="user-list" class="user-list"></ul>
+      </section>
+      <footer class="conn-info">
+        <div><span class="dot" id="conn-dot"></span><span id="conn-text">connecting…</span></div>
+        <div class="instance">server: <strong id="instance-name">—</strong></div>
+        <div class="instance">bot: <strong id="bot-mode">—</strong></div>
+      </footer>
+    </aside>
+
+    <main class="main">
+      <div id="messages" class="messages"></div>
+      <div id="typing" class="typing"></div>
+      <form id="message-form" class="composer">
+        <input id="message-input" type="text" maxlength="2000" placeholder="Message… (mention @ChatBot to talk to the bot)" autocomplete="off" />
+        <button type="submit" aria-label="Send">➤</button>
+      </form>
+    </main>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
