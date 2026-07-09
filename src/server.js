@@ -5,10 +5,9 @@ import express from 'express';
 import { Server } from 'socket.io';
 import { config } from './config.js';
 import { setupRedis } from './redis.js';
-import { createHistory } from './history.js';
-import { createPresence } from './presence.js';
+import { createStore } from './store.js';
 import { createBot } from './bot/index.js';
-import { registerChat } from './chat.js';
+import { registerAssistant } from './assistant.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -22,8 +21,7 @@ export async function createApp({ port = config.port } = {}) {
   });
 
   const redis = await setupRedis(io);
-  const history = createHistory(redis);
-  const presence = createPresence(io);
+  const store = createStore(redis);
   const bot = createBot();
 
   app.use(express.static(path.join(here, '..', 'public')));
@@ -31,7 +29,7 @@ export async function createApp({ port = config.port } = {}) {
     res.json({ ok: true, instance: config.instanceName, redis: redis.enabled }),
   );
 
-  registerChat(io, { history, presence, bot });
+  registerAssistant(io, { store, bot });
 
   await new Promise((resolve) => server.listen(port, resolve));
   console.log(`[server] instance "${config.instanceName}" listening on :${server.address().port}`);

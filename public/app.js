@@ -1,214 +1,385 @@
-/* global io */
+/* global io, marked, DOMPurify */
 (() => {
   const $ = (id) => document.getElementById(id);
-
-  const joinScreen = $('join-screen');
-  const chatScreen = $('chat-screen');
-  const joinForm = $('join-form');
-  const joinError = $('join-error');
+  const threadEl = $('thread');
   const messagesEl = $('messages');
-  const typingEl = $('typing');
-  const messageForm = $('message-form');
-  const messageInput = $('message-input');
-  const switchForm = $('switch-form');
-  const switchRoom = $('switch-room');
+  const heroEl = $('hero');
+  const convListEl = $('conv-list');
+  const inputEl = $('input');
+  const sendBtn = $('send-btn');
+  const stopBtn = $('stop-btn');
+  const sidebar = $('sidebar');
+
+  marked.setOptions({ breaks: true, gfm: true });
+  const render = (md) => DOMPurify.sanitize(marked.parse(md));
+
+  // stable anonymous identity so conversations survive reloads
+  let uid = localStorage.getItem('chatbot:uid');
+  if (!uid) {
+    uid = crypto.randomUUID();
+    localStorage.setItem('chatbot:uid', uid);
+  }
 
   const state = {
-    username: null,
-    room: null,
-    botName: 'ChatBot',
-    typers: new Set(),
-    streams: new Map(), // bot stream id -> bubble element
+    conversations: [],
+    activeId: null,
+    streamEl: null, // content element currently being streamed into
+    streamBuf: '',
+    generating: false,
   };
 
-  const socket = io({ autoConnect: true });
+  const socket = io({ auth: { uid } });
 
-  // ---------- connection status ----------
+  /* ================= connection ================= */
   socket.on('connect', () => {
     $('conn-dot').classList.add('on');
     $('conn-text').textContent = 'connected';
-    // reconnects land on a (possibly different) instance — rejoin the room
-    if (state.username && state.room) join(state.username, state.room);
+    refreshConversations().then(() => {
+      // re-open active conversation after reconnect (may be a new instance)
+      if (state.activeId) openConversation(state.activeId, { keepThread: true });
+    });
   });
   socket.on('disconnect', () => {
     $('conn-dot').classList.remove('on');
     $('conn-text').textContent = 'reconnecting…';
   });
+  socket.on('ready', ({ instance, botMode, model }) => {
+    $('instance-name').textContent = instance;
+    $('mode-text').textContent = botMode === 'claude' ? `model ${model}` : 'offline demo mode';
+    $('offline-note').hidden = botMode !== 'local';
+    if (botMode === 'local') {
+      $('hero-sub').textContent =
+        'Running in offline demo mode — replies are simple, but streaming, history and scaling are all real.';
+    }
+  });
 
-  // ---------- join / switch rooms ----------
-  function join(username, room) {
-    socket.emit('join', { username, room }, (res) => {
-      if (!res?.ok) {
-        joinError.textContent = res?.error ?? 'Could not join.';
-        joinError.hidden = false;
-        return;
-      }
-      state.username = res.username;
-      state.room = res.room;
-      state.botName = res.botName;
-      joinScreen.hidden = true;
-      chatScreen.hidden = false;
-      $('room-name').textContent = `# ${res.room}`;
-      $('instance-name').textContent = res.instance;
-      $('bot-mode').textContent = res.botMode === 'claude' ? 'Claude AI' : 'local (offline)';
-      messagesEl.innerHTML = '';
-      state.typers.clear();
-      renderTyping();
+  /* ================= conversations ================= */
+  const emit = (event, payload) =>
+    new Promise((resolve) => (payload === undefined ? socket.emit(event, resolve) : socket.emit(event, payload, resolve)));
+
+  async function refreshConversations() {
+    const res = await emit('conversations');
+    if (res?.ok) {
+      state.conversations = res.conversations;
+      renderConvList();
+    }
+  }
+
+  function renderConvList() {
+    convListEl.innerHTML = '';
+    for (const c of state.conversations) {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'conv-item' + (c.id === state.activeId ? ' active' : '');
+      item.dataset.id = c.id;
+
+      const title = document.createElement('span');
+      title.className = 'title';
+      title.textContent = c.title;
+
+      const del = document.createElement('span');
+      del.className = 'del';
+      del.title = 'Delete chat';
+      del.textContent = '🗑';
+      del.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        await emit('conversation:delete', { id: c.id });
+        state.conversations = state.conversations.filter((x) => x.id !== c.id);
+        if (state.activeId === c.id) {
+          state.activeId = null;
+          showHero();
+        }
+        renderConvList();
+      });
+
+      item.append(title, del);
+      item.addEventListener('click', () => openConversation(c.id));
+      convListEl.appendChild(item);
+    }
+  }
+
+  // "New chat" just shows the hero — the conversation itself is created
+  // lazily by send(), so abandoned chats never clutter the sidebar
+  function newConversation() {
+    state.activeId = null;
+    endStream();
+    setGenerating(false);
+    showHero();
+    renderConvList();
+    if (window.innerWidth <= 720) sidebar.classList.add('collapsed');
+    inputEl.focus();
+  }
+
+  async function openConversation(id, { keepThread = false } = {}) {
+    const res = await emit('conversation:open', { id });
+    if (!res?.ok) {
+      // conversation vanished (deleted elsewhere) — refresh the list
+      await refreshConversations();
+      return;
+    }
+    state.activeId = id;
+    $('topbar-title').textContent = res.conversation.title === 'New chat' ? '' : res.conversation.title;
+    renderConvList();
+    if (keepThread && state.generating) return; // don't clobber an in-progress stream
+
+    messagesEl.innerHTML = '';
+    endStream();
+    if (res.messages.length === 0) {
+      showHero();
+    } else {
+      hideHero();
       for (const m of res.messages) addMessage(m);
-      messageInput.focus();
-    });
+      scrollToBottom(true);
+    }
+    if (window.innerWidth <= 720) sidebar.classList.add('collapsed');
   }
 
-  joinForm.addEventListener('submit', (e) => {
-    e.preventDefault();
-    joinError.hidden = true;
-    join($('username').value.trim(), $('room').value.trim() || 'general');
-  });
-
-  switchForm.addEventListener('submit', (e) => {
-    e.preventDefault();
-    const room = switchRoom.value.trim();
-    if (room) {
-      join(state.username, room);
-      switchRoom.value = '';
+  socket.on('conversation:created', ({ conversation }) => {
+    if (!state.conversations.some((c) => c.id === conversation.id)) {
+      state.conversations.unshift(conversation);
+      renderConvList();
     }
   });
 
-  // ---------- sending ----------
-  messageForm.addEventListener('submit', (e) => {
-    e.preventDefault();
-    const text = messageInput.value.trim();
-    if (!text) return;
-    socket.emit('message', { text }, (res) => {
-      if (!res?.ok) flashSystem(res?.error ?? 'Message failed to send.');
-    });
-    messageInput.value = '';
-    sendTyping(false);
+  socket.on('conversation:updated', ({ conversation }) => {
+    const c = state.conversations.find((x) => x.id === conversation.id);
+    if (c) Object.assign(c, conversation);
+    else state.conversations.unshift(conversation);
+    state.conversations.sort((a, b) => b.updatedAt - a.updatedAt);
+    renderConvList();
+    if (conversation.id === state.activeId) $('topbar-title').textContent = conversation.title;
   });
 
-  let typingTimer = null;
-  let typingSent = false;
-  function sendTyping(isTyping) {
-    if (typingSent !== isTyping) {
-      socket.emit('typing', isTyping);
-      typingSent = isTyping;
+  socket.on('conversation:deleted', ({ id }) => {
+    state.conversations = state.conversations.filter((x) => x.id !== id);
+    if (state.activeId === id) {
+      state.activeId = null;
+      showHero();
     }
-  }
-  messageInput.addEventListener('input', () => {
-    sendTyping(messageInput.value.length > 0);
-    clearTimeout(typingTimer);
-    typingTimer = setTimeout(() => sendTyping(false), 2500);
+    renderConvList();
   });
 
-  // ---------- receiving ----------
-  socket.on('message', (m) => {
-    if (m.room !== state.room) return;
-    // bot message finalizes any live stream bubble with the same id
-    const streaming = state.streams.get(m.id);
-    if (streaming) {
-      streaming.remove();
-      state.streams.delete(m.id);
-    }
-    addMessage(m);
-  });
-
-  socket.on('presence', ({ room, users }) => {
-    if (room !== state.room) return;
-    $('user-count').textContent = `(${users.length})`;
-    $('user-list').innerHTML = '';
-    for (const u of users) {
-      const li = document.createElement('li');
-      li.textContent = u;
-      $('user-list').appendChild(li);
-    }
-  });
-
-  socket.on('typing', ({ username, isTyping }) => {
-    if (username === state.username) return;
-    if (isTyping) state.typers.add(username);
-    else state.typers.delete(username);
-    renderTyping();
-  });
-
-  // live-streamed bot reply
-  socket.on('bot-stream', ({ id, room, phase, chunk }) => {
-    if (room !== state.room) return;
-    if (phase === 'start') {
-      const el = buildMessage({ username: state.botName, text: '', ts: Date.now(), bot: true });
-      state.streams.set(id, el);
-      appendAndScroll(el);
-    } else if (phase === 'chunk') {
-      const el = state.streams.get(id);
-      if (el) {
-        el.querySelector('.bubble').textContent += chunk;
-        scrollDown();
-      }
-    }
-    // 'end' is handled by the final 'message' event replacing the bubble
-  });
-
-  // ---------- rendering ----------
-  function buildMessage(m) {
-    const el = document.createElement('div');
-    if (m.system) {
-      el.className = 'msg system';
-      el.textContent = m.text;
-      return el;
-    }
-    el.className = 'msg';
-    if (m.bot) el.classList.add('bot');
-    if (m.username === state.username) el.classList.add('me');
-
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    const author = document.createElement('span');
-    author.className = 'author';
-    author.textContent = m.username;
-    const time = document.createElement('span');
-    time.textContent = new Date(m.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    meta.append(author, time);
-    if (m.instance) {
-      const badge = document.createElement('span');
-      badge.className = 'badge';
-      badge.title = 'server instance that handled this message';
-      badge.textContent = m.instance;
-      meta.append(badge);
-    }
-
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble';
-    bubble.textContent = m.text;
-
-    el.append(meta, bubble);
-    return el;
-  }
-
+  /* ================= messages ================= */
   function addMessage(m) {
-    appendAndScroll(buildMessage(m));
+    hideHero();
+    const row = document.createElement('div');
+    row.className = `row ${m.role}`;
+    row.dataset.id = m.id;
+
+    const content = document.createElement('div');
+    content.className = 'content';
+
+    if (m.role === 'assistant') {
+      const avatar = document.createElement('div');
+      avatar.className = 'avatar';
+      avatar.textContent = '✦';
+      content.innerHTML = render(m.content);
+
+      const actions = document.createElement('div');
+      actions.className = 'msg-actions';
+      const copy = document.createElement('button');
+      copy.className = 'copy-btn';
+      copy.textContent = '⧉ copy';
+      copy.addEventListener('click', () => {
+        navigator.clipboard.writeText(m.content);
+        copy.textContent = '✓ copied';
+        setTimeout(() => (copy.textContent = '⧉ copy'), 1200);
+      });
+      actions.appendChild(copy);
+
+      const inner = document.createElement('div');
+      inner.style.minWidth = '0';
+      inner.append(content, actions);
+      row.append(avatar, inner);
+    } else {
+      content.textContent = m.content;
+      row.appendChild(content);
+    }
+
+    messagesEl.appendChild(row);
+    return content;
   }
 
-  function flashSystem(text) {
-    addMessage({ system: true, text });
+  /* ---- streaming assistant reply ---- */
+  socket.on('message:new', ({ conversationId, message }) => {
+    if (conversationId !== state.activeId) return;
+    if (messagesEl.querySelector(`[data-id="${message.id}"]`)) return;
+    addMessage(message);
+    scrollToBottom(message.role === 'user');
+  });
+
+  socket.on('assistant:start', ({ conversationId, id }) => {
+    if (conversationId !== state.activeId) return;
+    hideHero();
+    setGenerating(true);
+    const row = document.createElement('div');
+    row.className = 'row assistant';
+    row.dataset.id = id;
+    const avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    avatar.textContent = '✦';
+    const content = document.createElement('div');
+    content.className = 'content streaming';
+    const inner = document.createElement('div');
+    inner.style.minWidth = '0';
+    inner.appendChild(content);
+    row.append(avatar, inner);
+    messagesEl.appendChild(row);
+    state.streamEl = content;
+    state.streamBuf = '';
+    scrollToBottom();
+  });
+
+  let rafPending = false;
+  socket.on('assistant:delta', ({ conversationId, delta }) => {
+    if (conversationId !== state.activeId || !state.streamEl) return;
+    state.streamBuf += delta;
+    if (!rafPending) {
+      rafPending = true;
+      requestAnimationFrame(() => {
+        rafPending = false;
+        if (state.streamEl) {
+          state.streamEl.innerHTML = render(state.streamBuf);
+          scrollToBottom();
+        }
+      });
+    }
+  });
+
+  socket.on('assistant:done', ({ conversationId, message }) => {
+    if (conversationId !== state.activeId) return;
+    // replace the streaming row with the final rendered message
+    const row = messagesEl.querySelector(`[data-id="${message.id}"]`);
+    if (row) row.remove();
+    endStream();
+    addMessage(message);
+    setGenerating(false);
+    scrollToBottom();
+    refreshConversations();
+  });
+
+  socket.on('assistant:error', ({ conversationId, id, error }) => {
+    if (conversationId !== state.activeId) return;
+    const row = messagesEl.querySelector(`[data-id="${id}"]`);
+    if (row) row.remove();
+    endStream();
+    setGenerating(false);
+    const errRow = document.createElement('div');
+    errRow.className = 'row assistant error';
+    errRow.innerHTML = `<div class="avatar">✦</div><div class="content">⚠ ${error}</div>`;
+    messagesEl.appendChild(errRow);
+    scrollToBottom();
+  });
+
+  function endStream() {
+    if (state.streamEl) state.streamEl.classList.remove('streaming');
+    state.streamEl = null;
+    state.streamBuf = '';
   }
 
-  function appendAndScroll(el) {
-    const nearBottom =
-      messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 120;
-    messagesEl.appendChild(el);
-    if (nearBottom) scrollDown();
+  function setGenerating(on) {
+    state.generating = on;
+    stopBtn.hidden = !on;
+    updateSendBtn();
   }
 
-  function scrollDown() {
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+  /* ================= composer ================= */
+  async function send() {
+    const text = inputEl.value.trim();
+    if (!text || state.generating) return;
+
+    // lazily create a conversation on first message
+    if (!state.activeId) {
+      const res = await emit('conversation:new');
+      if (!res?.ok) return toast(res?.error);
+      state.conversations.unshift(res.conversation);
+      const open = await emit('conversation:open', { id: res.conversation.id });
+      if (!open?.ok) return toast(open?.error);
+      state.activeId = res.conversation.id;
+      renderConvList();
+    }
+
+    inputEl.value = '';
+    autosize();
+    updateSendBtn();
+    hideHero();
+
+    // the echoed message:new event renders the message (same socket, ~instant)
+    const res = await emit('message:send', { conversationId: state.activeId, text });
+    if (!res?.ok) {
+      inputEl.value = text;
+      autosize();
+      updateSendBtn();
+      return toast(res?.error);
+    }
   }
 
-  function renderTyping() {
-    const names = [...state.typers];
-    typingEl.textContent =
-      names.length === 0
-        ? ''
-        : names.length === 1
-          ? `${names[0]} is typing…`
-          : `${names.slice(0, 2).join(', ')}${names.length > 2 ? ` and ${names.length - 2} more` : ''} are typing…`;
+  $('composer').addEventListener('submit', (e) => {
+    e.preventDefault();
+    send();
+  });
+  inputEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  });
+  inputEl.addEventListener('input', () => {
+    autosize();
+    updateSendBtn();
+  });
+  stopBtn.addEventListener('click', () => {
+    socket.emit('assistant:stop', { conversationId: state.activeId });
+  });
+
+  function autosize() {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = `${Math.min(inputEl.scrollHeight, 200)}px`;
   }
+  function updateSendBtn() {
+    sendBtn.disabled = !inputEl.value.trim() || state.generating;
+  }
+
+  /* ================= misc UI ================= */
+  $('new-chat').addEventListener('click', newConversation);
+  $('collapse-btn').addEventListener('click', () => sidebar.classList.add('collapsed'));
+  $('open-sidebar').addEventListener('click', () => sidebar.classList.remove('collapsed'));
+
+  document.querySelectorAll('.suggestion').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      inputEl.value = btn.dataset.text;
+      autosize();
+      updateSendBtn();
+      send();
+    }),
+  );
+
+  function showHero() {
+    heroEl.style.display = '';
+    messagesEl.innerHTML = '';
+    $('topbar-title').textContent = '';
+  }
+  function hideHero() {
+    heroEl.style.display = 'none';
+  }
+
+  function scrollToBottom(force = false) {
+    const nearBottom = threadEl.scrollHeight - threadEl.scrollTop - threadEl.clientHeight < 140;
+    if (force || nearBottom) threadEl.scrollTop = threadEl.scrollHeight;
+  }
+
+  let toastTimer = null;
+  function toast(text) {
+    document.querySelector('.toast')?.remove();
+    const el = document.createElement('div');
+    el.className = 'toast';
+    el.textContent = text ?? 'Something went wrong.';
+    document.body.appendChild(el);
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.remove(), 3500);
+  }
+
+  // start collapsed on mobile
+  if (window.innerWidth <= 720) sidebar.classList.add('collapsed');
+  updateSendBtn();
 })();

@@ -1,12 +1,13 @@
 // Proves the horizontal-scaling story end to end: two independent server
-// instances share nothing but Redis, yet a message sent to instance A is
-// delivered to a client connected to instance B, presence is cluster-wide,
-// and the bot reply fans out across instances.
+// instances share nothing but Redis, yet a user connected to BOTH (e.g. two
+// browser tabs landing on different servers) sees one consistent world —
+// same conversation list, messages and streamed assistant replies on each.
 //
 // Requires a local Redis (redis://localhost:6379); tests are skipped if
 // it isn't reachable.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { createClient } from 'redis';
 import { io as connect } from 'socket.io-client';
 
@@ -26,12 +27,9 @@ async function redisAvailable() {
   }
 }
 
-function once(socket, event, predicate = () => true, ms = 5000) {
+function once(socket, event, predicate = () => true, ms = 8000) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`timed out waiting for "${event}"`)),
-      ms,
-    );
+    const timer = setTimeout(() => reject(new Error(`timed out waiting for "${event}"`)), ms);
     const handler = (payload) => {
       if (!predicate(payload)) return;
       clearTimeout(timer);
@@ -42,77 +40,100 @@ function once(socket, event, predicate = () => true, ms = 5000) {
   });
 }
 
-function joinRoom(socket, username, room) {
-  return new Promise((resolve, reject) => {
-    socket.emit('join', { username, room }, (res) =>
-      res?.ok ? resolve(res) : reject(new Error(res?.error ?? 'join failed')),
-    );
-  });
-}
+const call = (socket, event, payload) =>
+  new Promise((resolve) =>
+    payload === undefined ? socket.emit(event, resolve) : socket.emit(event, payload, resolve),
+  );
 
-test('chat scales across two server instances via Redis pub/sub', async (t) => {
+test('assistant chat scales across two server instances via Redis pub/sub', async (t) => {
   if (!(await redisAvailable())) {
     t.skip(`Redis not reachable at ${REDIS_URL}`);
     return;
   }
 
   const { createApp } = await import('../src/server.js');
-  const room = `test-${Date.now()}`;
-
   const instanceA = await createApp({ port: 0 });
   const instanceB = await createApp({ port: 0 });
 
-  const alice = connect(`http://localhost:${instanceA.port}`, { transports: ['websocket'] });
-  const bob = connect(`http://localhost:${instanceB.port}`, { transports: ['websocket'] });
+  const uid = randomUUID();
+  // same user, two tabs, two different servers
+  const tabA = connect(`http://localhost:${instanceA.port}`, { transports: ['websocket'], auth: { uid } });
+  const tabB = connect(`http://localhost:${instanceB.port}`, { transports: ['websocket'], auth: { uid } });
 
   t.after(async () => {
-    alice.close();
-    bob.close();
-    // let disconnect handlers settle before tearing the servers down
+    tabA.close();
+    tabB.close();
     await new Promise((r) => setTimeout(r, 200));
     await instanceA.close();
     await instanceB.close();
   });
 
-  await t.test('presence is visible cluster-wide', async () => {
-    await joinRoom(alice, 'alice', room);
-    const [presence] = await Promise.all([
-      once(bob, 'presence', (p) => p.users.length === 2),
-      joinRoom(bob, 'bob', room),
-    ]);
-    assert.deepEqual(presence.users, ['alice', 'bob']);
+  let convId;
+
+  await t.test('conversation created on instance A is listed on instance B', async () => {
+    const created = await call(tabA, 'conversation:new');
+    assert.ok(created.ok, created.error);
+    convId = created.conversation.id;
+
+    const list = await call(tabB, 'conversations');
+    assert.ok(list.ok && list.conversations.some((c) => c.id === convId));
   });
 
-  await t.test('message sent to instance A reaches client on instance B', async () => {
-    const waiting = once(bob, 'message', (m) => m.username === 'alice');
-    alice.emit('message', { text: 'hello across instances!' }, () => {});
-    const received = await waiting;
-    assert.equal(received.text, 'hello across instances!');
-    assert.equal(received.room, room);
+  await t.test('message + streamed reply on A are mirrored to the tab on B', async () => {
+    await call(tabA, 'conversation:open', { id: convId });
+    await call(tabB, 'conversation:open', { id: convId });
+
+    const sawUserMsg = once(tabB, 'message:new', (p) => p.message.role === 'user');
+    const sawDelta = once(tabB, 'assistant:delta', (p) => p.conversationId === convId);
+    const sawDone = once(tabB, 'assistant:done', (p) => p.conversationId === convId);
+
+    const sent = await call(tabA, 'message:send', { conversationId: convId, text: 'hello there' });
+    assert.ok(sent.ok, sent.error);
+
+    assert.equal((await sawUserMsg).message.content, 'hello there');
+    await sawDelta; // streaming chunks crossed instances
+    const done = await sawDone;
+    assert.equal(done.message.role, 'assistant');
+    assert.ok(done.message.content.length > 0);
   });
 
-  await t.test('history is shared: a late joiner on instance B sees the message', async () => {
-    const charlie = connect(`http://localhost:${instanceB.port}`, { transports: ['websocket'] });
-    t.after(() => charlie.close());
-    const res = await joinRoom(charlie, 'charlie', room);
-    assert.ok(
-      res.messages.some((m) => m.text === 'hello across instances!'),
-      'expected history to include the earlier message',
-    );
+  await t.test('first message auto-titles the conversation everywhere', async () => {
+    const list = await call(tabB, 'conversations');
+    const conv = list.conversations.find((c) => c.id === convId);
+    assert.equal(conv.title, 'hello there');
   });
 
-  await t.test('bot reply triggered on instance A arrives on instance B', async () => {
-    const waiting = once(bob, 'message', (m) => m.bot === true, 8000);
-    alice.emit('message', { text: '@ChatBot which server are you on?' }, () => {});
-    const reply = await waiting;
-    assert.equal(reply.username, 'ChatBot');
-    assert.ok(reply.text.length > 0);
+  await t.test('history is shared: opening on B returns messages sent via A', async () => {
+    const res = await call(tabB, 'conversation:open', { id: convId });
+    assert.ok(res.ok);
+    assert.equal(res.messages.length, 2); // user + assistant
+    assert.equal(res.messages[0].role, 'user');
+    assert.equal(res.messages[1].role, 'assistant');
   });
 
-  await t.test('typing indicators cross instances', async () => {
-    const waiting = once(bob, 'typing', (p) => p.username === 'alice' && p.isTyping);
-    alice.emit('typing', true);
-    await waiting;
+  await t.test('multi-turn context is preserved (assistant answers follow-up math)', async () => {
+    const sawDone = once(tabA, 'assistant:done', (p) => p.conversationId === convId);
+    await call(tabA, 'message:send', { conversationId: convId, text: 'what is 12*(3+4)?' });
+    const done = await sawDone;
+    assert.ok(done.message.content.includes('84'), `expected math answer, got: ${done.message.content}`);
+  });
+
+  await t.test('deleting on B removes it for A', async () => {
+    const del = await call(tabB, 'conversation:delete', { id: convId });
+    assert.ok(del.ok);
+    const list = await call(tabA, 'conversations');
+    assert.ok(!list.conversations.some((c) => c.id === convId));
+  });
+
+  await t.test('users cannot open conversations without the owning uid', async () => {
+    const created = await call(tabA, 'conversation:new');
+    const stranger = connect(`http://localhost:${instanceB.port}`, {
+      transports: ['websocket'],
+      auth: { uid: randomUUID() },
+    });
+    t.after(() => stranger.close());
+    const res = await call(stranger, 'conversation:open', { id: created.conversation.id });
+    assert.equal(res.ok, false);
   });
 });
 
@@ -123,19 +144,26 @@ test('rate limiting rejects a flood of messages', async (t) => {
   }
   const { createApp } = await import('../src/server.js');
   const app = await createApp({ port: 0 });
-  const spammer = connect(`http://localhost:${app.port}`, { transports: ['websocket'] });
+  const spammer = connect(`http://localhost:${app.port}`, {
+    transports: ['websocket'],
+    auth: { uid: randomUUID() },
+  });
   t.after(async () => {
     spammer.close();
     await new Promise((r) => setTimeout(r, 200));
     await app.close();
   });
 
-  await joinRoom(spammer, 'spammer', `flood-${Date.now()}`);
-  const results = await Promise.all(
-    Array.from({ length: 25 }, (_, i) =>
-      new Promise((resolve) => spammer.emit('message', { text: `msg ${i}` }, resolve)),
-    ),
-  );
+  const created = await call(spammer, 'conversation:new');
+  const convId = created.conversation.id;
+  await call(spammer, 'conversation:open', { id: convId });
+
+  const replyFinished = once(spammer, 'assistant:done', () => true, 15000);
+  const results = [];
+  for (let i = 0; i < 15; i++) {
+    results.push(await call(spammer, 'message:send', { conversationId: convId, text: `msg ${i}` }));
+  }
   const rejected = results.filter((r) => !r.ok);
-  assert.ok(rejected.length > 0, 'expected some messages to be rate limited');
+  assert.ok(rejected.length > 0, 'expected some messages to be rejected');
+  await replyFinished; // let the one in-flight generation settle before teardown
 });

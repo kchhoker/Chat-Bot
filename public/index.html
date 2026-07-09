@@ -3,62 +3,72 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Chat-Bot — realtime chat at scale</title>
+  <title>Chat-Bot</title>
   <link rel="stylesheet" href="/style.css" />
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💬</text></svg>" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>✦</text></svg>" />
 </head>
 <body>
-  <!-- Join screen -->
-  <div id="join-screen" class="join-screen">
-    <form id="join-form" class="join-card">
-      <h1>💬 Chat-Bot</h1>
-      <p class="tagline">Real-time chat over WebSockets, scaled across server instances with Redis pub/sub.</p>
-      <label>
-        Name
-        <input id="username" type="text" maxlength="32" placeholder="e.g. kabir" autocomplete="off" required />
-      </label>
-      <label>
-        Room
-        <input id="room" type="text" maxlength="32" placeholder="general" autocomplete="off" value="general" />
-      </label>
-      <button type="submit">Join chat</button>
-      <p id="join-error" class="error" hidden></p>
-    </form>
-  </div>
+  <div class="app">
+    <!-- ============ sidebar ============ -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-head">
+        <span class="brand"><span class="brand-mark">✦</span> Chat-Bot</span>
+        <button id="collapse-btn" class="icon-btn" title="Close sidebar" aria-label="Close sidebar">⟨</button>
+      </div>
 
-  <!-- Chat screen -->
-  <div id="chat-screen" class="chat-screen" hidden>
-    <aside class="sidebar">
-      <header class="brand">💬 Chat-Bot</header>
-      <section class="panel">
-        <h2>Room</h2>
-        <div id="room-name" class="room-name"></div>
-        <form id="switch-form" class="switch-form">
-          <input id="switch-room" type="text" maxlength="32" placeholder="switch room…" autocomplete="off" />
-        </form>
-      </section>
-      <section class="panel">
-        <h2>Online <span id="user-count" class="count"></span></h2>
-        <ul id="user-list" class="user-list"></ul>
-      </section>
-      <footer class="conn-info">
-        <div><span class="dot" id="conn-dot"></span><span id="conn-text">connecting…</span></div>
-        <div class="instance">server: <strong id="instance-name">—</strong></div>
-        <div class="instance">bot: <strong id="bot-mode">—</strong></div>
+      <button id="new-chat" class="new-chat-btn">
+        <span class="plus">+</span> New chat
+      </button>
+
+      <nav id="conv-list" class="conv-list" aria-label="Conversations"></nav>
+
+      <footer class="sidebar-foot">
+        <div class="status-row"><span class="dot" id="conn-dot"></span><span id="conn-text">connecting…</span></div>
+        <div class="status-row dim" id="mode-text"></div>
+        <div class="status-row dim">server <span class="chip" id="instance-name">—</span></div>
       </footer>
     </aside>
 
+    <!-- ============ main ============ -->
     <main class="main">
-      <div id="messages" class="messages"></div>
-      <div id="typing" class="typing"></div>
-      <form id="message-form" class="composer">
-        <input id="message-input" type="text" maxlength="2000" placeholder="Message… (mention @ChatBot to talk to the bot)" autocomplete="off" />
-        <button type="submit" aria-label="Send">➤</button>
-      </form>
+      <div class="topbar">
+        <button id="open-sidebar" class="icon-btn" title="Open sidebar" aria-label="Open sidebar">☰</button>
+        <span id="topbar-title" class="topbar-title"></span>
+      </div>
+
+      <div id="thread" class="thread">
+        <!-- welcome / hero -->
+        <div id="hero" class="hero">
+          <div class="hero-mark">✦</div>
+          <h1>What can I help with?</h1>
+          <p class="hero-sub" id="hero-sub">Your conversation is streamed in real time and remembered across visits.</p>
+          <div class="suggestions">
+            <button class="suggestion" data-text="Explain how this chat app scales across multiple servers">🏗️<span>Explain how this app scales across servers</span></button>
+            <button class="suggestion" data-text="What is 128 * (7 + 3) / 4?">🧮<span>Do some quick math for me</span></button>
+            <button class="suggestion" data-text="Tell me a programming joke">😄<span>Tell me a programming joke</span></button>
+            <button class="suggestion" data-text="Write a haiku about WebSockets">✍️<span>Write a haiku about WebSockets</span></button>
+          </div>
+        </div>
+        <div id="messages" class="messages"></div>
+      </div>
+
+      <div class="composer-wrap">
+        <div id="offline-note" class="offline-note" hidden>
+          Offline demo mode — start the server with <code>ANTHROPIC_API_KEY</code> for the full AI.
+        </div>
+        <form id="composer" class="composer">
+          <textarea id="input" rows="1" placeholder="Message the assistant…" maxlength="8000"></textarea>
+          <button type="button" id="stop-btn" class="stop-btn" hidden title="Stop generating">■</button>
+          <button type="submit" id="send-btn" class="send-btn" title="Send" aria-label="Send" disabled>↑</button>
+        </form>
+        <p class="fineprint">Enter to send · Shift+Enter for a new line</p>
+      </div>
     </main>
   </div>
 
   <script src="/socket.io/socket.io.js"></script>
+  <script src="/vendor/marked.js"></script>
+  <script src="/vendor/purify.min.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>
